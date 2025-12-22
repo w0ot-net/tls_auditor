@@ -88,6 +88,16 @@ WEAK_CIPHERS = {
 # Grades considered weak (B through F)
 WEAK_GRADES = {"B", "C", "D", "E", "F"}
 
+# Canonical protocol list (single source of truth)
+PROTOCOLS = ("SSLv2", "SSLv3", "TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3")
+
+
+def format_host_port(host: str, port: str) -> str:
+    """Format host:port, bracketing IPv6 literals."""
+    if ":" in host:
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
 
 # =============================================================================
 # INPUT PARSING
@@ -222,25 +232,6 @@ def run_nmap(input_file: str, ports: str, xml_output: str) -> bool:
 # XML PARSING
 # =============================================================================
 
-def parse_cipher_grade(cipher_line: str) -> Tuple[str, str]:
-    """
-    Parse cipher name and grade from nmap output.
-    Example: "TLS_RSA_WITH_AES_128_CBC_SHA (rsa 2048) - A"
-    Returns: (cipher_name, grade)
-    """
-    # Match cipher name and grade
-    match = re.match(r"(\S+)\s+.*-\s+([A-F])", cipher_line)
-    if match:
-        return match.group(1), match.group(2)
-    
-    # Fallback: just get the cipher name
-    parts = cipher_line.split()
-    if parts:
-        return parts[0], ""
-    
-    return cipher_line, ""
-
-
 def is_cipher_insecure(cipher_name: str, grade: str, protocol: str) -> bool:
     """Determine if a cipher should be reported as insecure."""
     # All ciphers in deprecated protocols are insecure
@@ -333,14 +324,8 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
                 continue
             
             # Initialize cipher data for each protocol
-            cipher_data = {
-                "SSLv2": [],
-                "SSLv3": [],
-                "TLSv1.0": [],
-                "TLSv1.1": [],
-                "TLSv1.2": [],
-                "TLSv1.3": [],
-            }
+            cipher_data = {p: [] for p in PROTOCOLS}
+            protocols_present = set()  # Track which protocols were seen (even if empty)
             
             # Parse ssl-enum-ciphers output
             if ssl_script is not None:
@@ -348,6 +333,9 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
                     protocol = table.get("key", "")
                     if protocol not in cipher_data:
                         continue
+                    
+                    # Mark this protocol as present
+                    protocols_present.add(protocol)
                     
                     # Find ciphers table within this protocol
                     ciphers_table = table.find("table[@key='ciphers']")
@@ -372,6 +360,9 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
             if sslv2_script is not None:
                 output = sslv2_script.get("output", "")
                 if "SSLv2 supported" in output:
+                    # Mark SSLv2 as present
+                    protocols_present.add("SSLv2")
+                    
                     # Extract SSLv2 ciphers
                     for cipher_table in sslv2_script.findall(".//table[@key='ciphers']/table"):
                         for elem in cipher_table.findall("elem[@key='name']"):
@@ -394,25 +385,29 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
                 svc = "ssl"
             
             # Format cipher output
-            def format_ciphers(ciphers: List[str], protocol: str) -> str:
+            def format_ciphers(ciphers: List[str], protocol: str, present: bool) -> str:
+                if protocol in DEPRECATED_PROTOCOLS:
+                    # Deprecated protocol: report "All" if present, even if cipher list is empty
+                    if present or ciphers:
+                        return "All"
+                    return "-"
                 if not ciphers:
                     return "-"
-                if protocol in DEPRECATED_PROTOCOLS:
-                    return "All"
                 return ", ".join(sorted(set(ciphers)))
             
             # Check if there are any issues
-            has_issues = any(cipher_data[p] for p in cipher_data)
+            has_issues = any(cipher_data[p] for p in PROTOCOLS) or \
+                         any(p in protocols_present for p in DEPRECATED_PROTOCOLS)
             
             if has_issues:
                 results.append({
-                    "host_port": f"{host_display}:{port_id}",
-                    "SSLv2": format_ciphers(cipher_data["SSLv2"], "SSLv2"),
-                    "SSLv3": format_ciphers(cipher_data["SSLv3"], "SSLv3"),
-                    "TLSv1.0": format_ciphers(cipher_data["TLSv1.0"], "TLSv1.0"),
-                    "TLSv1.1": format_ciphers(cipher_data["TLSv1.1"], "TLSv1.1"),
-                    "TLSv1.2": format_ciphers(cipher_data["TLSv1.2"], "TLSv1.2"),
-                    "TLSv1.3": format_ciphers(cipher_data["TLSv1.3"], "TLSv1.3"),
+                    "host_port": format_host_port(host_display, port_id),
+                    "SSLv2": format_ciphers(cipher_data["SSLv2"], "SSLv2", "SSLv2" in protocols_present),
+                    "SSLv3": format_ciphers(cipher_data["SSLv3"], "SSLv3", "SSLv3" in protocols_present),
+                    "TLSv1.0": format_ciphers(cipher_data["TLSv1.0"], "TLSv1.0", "TLSv1.0" in protocols_present),
+                    "TLSv1.1": format_ciphers(cipher_data["TLSv1.1"], "TLSv1.1", "TLSv1.1" in protocols_present),
+                    "TLSv1.2": format_ciphers(cipher_data["TLSv1.2"], "TLSv1.2", "TLSv1.2" in protocols_present),
+                    "TLSv1.3": format_ciphers(cipher_data["TLSv1.3"], "TLSv1.3", "TLSv1.3" in protocols_present),
                     "ip": ip,
                     "hostname": hostname if hostname else "-",
                     "port": port_id,
@@ -428,7 +423,7 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
 
 def write_cipher_csv(results: List[Dict], output_file: str) -> None:
     """Write cipher table to CSV file."""
-    fieldnames = ["host_port", "SSLv2", "SSLv3", "TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"]
+    fieldnames = ["host_port"] + list(PROTOCOLS)
     
     with open(output_file, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -455,23 +450,21 @@ def write_affected_csv(results: List[Dict], output_file: str) -> None:
 def print_summary(results: List[Dict]) -> None:
     """Print summary of findings."""
     if not results:
-        print("[*] No SSL/TLS issues found")
+        print("[*] No SSL/TLS services with issues found")
         return
     
     print(f"\n[+] Found {len(results)} host(s) with insecure ciphers:")
     
     # Count by protocol
-    proto_counts = {
-        "SSLv2": 0, "SSLv3": 0, "TLSv1.0": 0,
-        "TLSv1.1": 0, "TLSv1.2": 0, "TLSv1.3": 0
-    }
+    proto_counts = {p: 0 for p in PROTOCOLS}
     
     for r in results:
-        for proto in proto_counts:
+        for proto in PROTOCOLS:
             if r.get(proto, "-") != "-":
                 proto_counts[proto] += 1
     
-    for proto, count in proto_counts.items():
+    for proto in PROTOCOLS:
+        count = proto_counts[proto]
         if count > 0:
             print(f"    {proto}: {count} host(s)")
 
