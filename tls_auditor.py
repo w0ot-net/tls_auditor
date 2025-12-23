@@ -401,7 +401,7 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
             
             if has_issues:
                 results.append({
-                    "host_port": format_host_port(host_display, port_id),
+                    "Host:Port": format_host_port(host_display, port_id),
                     "SSLv2": format_ciphers(cipher_data["SSLv2"], "SSLv2", "SSLv2" in protocols_present),
                     "SSLv3": format_ciphers(cipher_data["SSLv3"], "SSLv3", "SSLv3" in protocols_present),
                     "TLSv1.0": format_ciphers(cipher_data["TLSv1.0"], "TLSv1.0", "TLSv1.0" in protocols_present),
@@ -423,7 +423,7 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
 
 def write_cipher_csv(results: List[Dict], output_file: str) -> None:
     """Write cipher table to CSV file."""
-    fieldnames = ["host_port"] + list(PROTOCOLS)
+    fieldnames = ["Host:Port"] + list(PROTOCOLS)
     
     with open(output_file, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
