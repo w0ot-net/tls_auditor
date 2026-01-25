@@ -204,20 +204,23 @@ def build_nmap_targets(targets: List[Dict[str, str]], temp_file: str) -> Tuple[s
 # NMAP EXECUTION
 # =============================================================================
 
-def run_nmap(input_file: str, ports: str, xml_output: str) -> bool:
+def run_nmap(input_file: str, ports: str, xml_output: str, timing: Optional[str] = None) -> bool:
     """Run nmap with ssl-enum-ciphers and sslv2 scripts."""
     cmd = [
         "nmap",
         "-Pn",
-        "-T4",
         "-p", ports,
         "-iL", input_file,
         "--script", "ssl-enum-ciphers,sslv2",
         "-oX", xml_output,
     ]
-    
+
+    # Only add timing flag if specified
+    if timing is not None:
+        cmd.insert(2, f"-T{timing}")
+
     print(f"[*] Running: {' '.join(cmd)}")
-    
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -417,6 +420,49 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
     return results
 
 
+def aggregate_results(
+    xml_files: List[str], rich_targets: Optional[List[Dict[str, str]]] = None
+) -> List[Dict]:
+    """
+    Aggregate cipher findings from multiple nmap XML files.
+    Deduplicates findings across rounds - a cipher is reported if found in ANY round.
+    """
+    all_results = []
+    seen_host_ports = {}  # host:port -> merged result dict
+
+    for xml_file in xml_files:
+        results = parse_nmap_xml(xml_file, rich_targets)
+
+        for row in results:
+            host_port = row["Host:Port"]
+
+            if host_port not in seen_host_ports:
+                seen_host_ports[host_port] = row.copy()
+            else:
+                # Merge ciphers from this round into existing result
+                existing = seen_host_ports[host_port]
+                for proto in PROTOCOLS:
+                    existing_val = existing.get(proto, "-")
+                    new_val = row.get(proto, "-")
+
+                    if existing_val == "-":
+                        existing[proto] = new_val
+                    elif new_val != "-" and new_val != "All":
+                        # Merge cipher lists (both are non-empty, non-"All")
+                        if existing_val == "All":
+                            pass  # Keep "All"
+                        else:
+                            existing_ciphers = set(c.strip() for c in existing_val.split(","))
+                            new_ciphers = set(c.strip() for c in new_val.split(","))
+                            merged = existing_ciphers | new_ciphers
+                            existing[proto] = ", ".join(sorted(merged))
+                    elif new_val == "All":
+                        existing[proto] = "All"
+
+    all_results = list(seen_host_ports.values())
+    return all_results
+
+
 # =============================================================================
 # OUTPUT GENERATION
 # =============================================================================
@@ -522,8 +568,31 @@ Examples:
         action="store_true",
         help="Keep the intermediate nmap XML file"
     )
-    
+
+    parser.add_argument(
+        "-T", "--timing",
+        type=str,
+        default=None,
+        metavar="0-5",
+        help="nmap timing template (0-5). If not specified, nmap uses its default."
+    )
+
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        choices=range(1, 11),
+        metavar="N",
+        help="Number of times to run the scan (1-10). Results are aggregated. Default: 1"
+    )
+
     args = parser.parse_args()
+
+    # Validate timing template if specified
+    if args.timing is not None:
+        valid_timing = ["0", "1", "2", "3", "4", "5"]
+        if args.timing not in valid_timing:
+            parser.error(f"Invalid timing template: {args.timing}. Must be 0-5.")
     
     # Generate output filename prefix
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -593,19 +662,39 @@ Examples:
             nmap_input = temp_file
             ports = args.ports
         
-        # Run nmap
+        # Run nmap (potentially multiple rounds)
         print(f"[*] Scanning ports: {ports}")
-        
-        if not run_nmap(nmap_input, ports, xml_output):
-            print("[!] nmap scan failed", file=sys.stderr)
+
+        xml_files = []
+        for round_num in range(1, args.rounds + 1):
+            if args.rounds > 1:
+                print(f"\n[*] Starting scan round {round_num}/{args.rounds}")
+                round_xml = f"{output_prefix}_round{round_num}.xml"
+            else:
+                round_xml = xml_output
+
+            success = run_nmap(nmap_input, ports, round_xml, args.timing)
+            if success:
+                xml_files.append(round_xml)
+            else:
+                print(f"[!] Round {round_num} failed", file=sys.stderr)
+
+        if not xml_files:
+            print("[!] All nmap scans failed", file=sys.stderr)
             sys.exit(1)
-        
+
         # Cleanup temp file
         Path(temp_file).unlink(missing_ok=True)
-    
+
     # Parse results
     print("[*] Parsing results...")
-    results = parse_nmap_xml(xml_output, rich_targets)
+    if args.xml:
+        results = parse_nmap_xml(xml_output, rich_targets)
+        xml_files = [xml_output]
+    elif args.rounds > 1:
+        results = aggregate_results(xml_files, rich_targets)
+    else:
+        results = parse_nmap_xml(xml_files[0], rich_targets)
     
     if not results:
         print("[*] No SSL/TLS services with issues found")
@@ -618,9 +707,11 @@ Examples:
     
     # Cleanup XML unless requested to keep (or if parsing existing)
     if not args.keep_xml and not args.xml:
-        Path(xml_output).unlink(missing_ok=True)
-    elif args.keep_xml:
-        print(f"[*] XML file kept: {xml_output}")
+        for xml_file in xml_files:
+            Path(xml_file).unlink(missing_ok=True)
+    elif args.keep_xml and not args.xml:
+        for xml_file in xml_files:
+            print(f"[*] XML file kept: {xml_file}")
     
     print("[+] Done")
 
