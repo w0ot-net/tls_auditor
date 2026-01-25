@@ -396,7 +396,7 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
                     return "-"
                 if not ciphers:
                     return "-"
-                return ", ".join(sorted(set(ciphers)))
+                return "\n".join(sorted(set(ciphers)))
             
             # Check if there are any issues
             has_issues = any(cipher_data[p] for p in PROTOCOLS) or \
@@ -452,10 +452,10 @@ def aggregate_results(
                         if existing_val == "All":
                             pass  # Keep "All"
                         else:
-                            existing_ciphers = set(c.strip() for c in existing_val.split(","))
-                            new_ciphers = set(c.strip() for c in new_val.split(","))
+                            existing_ciphers = set(c.strip() for c in existing_val.split("\n"))
+                            new_ciphers = set(c.strip() for c in new_val.split("\n"))
                             merged = existing_ciphers | new_ciphers
-                            existing[proto] = ", ".join(sorted(merged))
+                            existing[proto] = "\n".join(sorted(merged))
                     elif new_val == "All":
                         existing[proto] = "All"
 
