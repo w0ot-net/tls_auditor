@@ -153,21 +153,50 @@ def parse_simple_input(input_file: str) -> List[str]:
     return list(set(hosts))  # Deduplicate
 
 
-def detect_input_format(input_file: str) -> str:
-    """Detect whether input file is 'rich' or 'simple' format."""
+def parse_hostport_input(input_file: str) -> List[Dict[str, str]]:
+    """Parse host:port input format (one host:port per line)."""
+    targets = []
+    seen = set()
+
     with open(input_file, "r") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            
+
+            host, _, port = line.rpartition(":")
+            if not host or not port:
+                continue
+
+            key = (host, port)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            targets.append({"ip": host, "hostname": "", "port": port, "service": ""})
+
+    return targets
+
+
+def detect_input_format(input_file: str) -> str:
+    """Detect whether input file is 'rich', 'hostport', or 'simple' format."""
+    with open(input_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
             # Check for tab-separated format with port info
             if "\t" in line or re.search(r"\s{2,}", line):
                 if re.search(r"\(\d+/tcp\)", line):
                     return "rich"
-            
+
+            # Check for host:port format
+            if re.match(r"^[\w.\-\[\]]+:\d+$", line):
+                return "hostport"
+
             return "simple"
-    
+
     return "simple"
 
 
@@ -530,6 +559,11 @@ Input formats:
     192.168.1.2
     example.com
 
+  Host:port (auto-detects ports):
+    192.168.1.1:443
+    192.168.1.2:8443
+    example.com:636
+
   Rich (auto-detects ports):
     172.16.1.10    AD02.example.com    ldaps? (636/tcp)
     172.16.1.41    Web.example.com     www (443/tcp)
@@ -538,6 +572,7 @@ Input formats:
 Examples:
   %(prog)s -i hosts.txt -p 443
   %(prog)s -i hosts.txt -p 443,636,3389
+  %(prog)s -i tls.txt
   %(prog)s -i rich_targets.txt
   %(prog)s --xml existing_scan.xml -o results.csv
         """
@@ -627,19 +662,23 @@ Examples:
         input_format = detect_input_format(args.input)
         print(f"[*] Detected input format: {input_format}")
         
-        if input_format == "rich":
-            # Parse rich format
-            rich_targets = parse_rich_input(args.input)
+        if input_format in ("rich", "hostport"):
+            # Parse rich or host:port format
+            if input_format == "rich":
+                rich_targets = parse_rich_input(args.input)
+            else:
+                rich_targets = parse_hostport_input(args.input)
+
             if not rich_targets:
                 print("[!] Error: No valid targets found in input file", file=sys.stderr)
                 sys.exit(1)
-            
+
             print(f"[*] Found {len(rich_targets)} target(s)")
-            
+
             # Build nmap input
             temp_file = f"/tmp/ssl_audit_{timestamp}_hosts.txt"
             nmap_input, ports = build_nmap_targets(rich_targets, temp_file)
-            
+
         else:
             # Simple format - ports required
             if not args.ports:
