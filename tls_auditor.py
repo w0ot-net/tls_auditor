@@ -492,6 +492,75 @@ def aggregate_results(
     return all_results
 
 
+def read_cipher_csv(csv_file: str) -> List[Dict]:
+    """Read a cipher audit CSV and return result dicts compatible with merge."""
+    results = []
+    with open(csv_file, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            host_port = row.get("Host:Port", "")
+            if not host_port:
+                continue
+
+            # Parse host and port back from Host:Port
+            if host_port.startswith("["):
+                # IPv6: [addr]:port
+                bracket_end = host_port.index("]")
+                host = host_port[1:bracket_end]
+                port = host_port[bracket_end + 2:]
+            else:
+                host, _, port = host_port.rpartition(":")
+
+            result = {
+                "Host:Port": host_port,
+                "ip": host,
+                "hostname": "-",
+                "port": port,
+                "service": "ssl",
+            }
+            for proto in PROTOCOLS:
+                result[proto] = row.get(proto, "-") or "-"
+
+            results.append(result)
+
+    return results
+
+
+def merge_cipher_csvs(csv_files: List[str]) -> List[Dict]:
+    """Merge multiple cipher audit CSVs, deduplicating by Host:Port."""
+    seen: Dict[str, Dict] = {}
+
+    for csv_file in csv_files:
+        for row in read_cipher_csv(csv_file):
+            host_port = row["Host:Port"]
+
+            if host_port not in seen:
+                seen[host_port] = row.copy()
+            else:
+                existing = seen[host_port]
+                for proto in PROTOCOLS:
+                    existing_val = existing.get(proto, "-")
+                    new_val = row.get(proto, "-")
+
+                    if existing_val == "-":
+                        existing[proto] = new_val
+                    elif new_val != "-" and new_val != "All":
+                        if existing_val != "All":
+                            existing_ciphers = set(
+                                c.strip() for c in existing_val.split("\n")
+                            )
+                            new_ciphers = set(
+                                c.strip() for c in new_val.split("\n")
+                            )
+                            existing[proto] = "\n".join(
+                                sorted(existing_ciphers | new_ciphers)
+                            )
+                    elif new_val == "All":
+                        existing[proto] = "All"
+
+    return list(seen.values())
+
+
 # =============================================================================
 # OUTPUT GENERATION
 # =============================================================================
@@ -575,6 +644,7 @@ Examples:
   %(prog)s -i tls.txt
   %(prog)s -i rich_targets.txt
   %(prog)s --xml existing_scan.xml -o results.csv
+  %(prog)s --merge scan1.csv scan2.csv -o combined
         """
     )
     
@@ -586,6 +656,12 @@ Examples:
     input_group.add_argument(
         "--xml",
         help="Parse existing nmap XML file instead of scanning"
+    )
+    input_group.add_argument(
+        "--merge",
+        nargs="+",
+        metavar="CSV",
+        help="Merge multiple cipher audit CSV files (not affected CSVs)"
     )
     
     parser.add_argument(
@@ -622,6 +698,30 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Handle --merge mode early (no scanning needed)
+    if args.merge:
+        for f in args.merge:
+            if not Path(f).is_file():
+                print(f"[!] Error: CSV file not found: {f}", file=sys.stderr)
+                sys.exit(1)
+
+        print(f"[*] Merging {len(args.merge)} CSV file(s)...")
+        results = merge_cipher_csvs(args.merge)
+
+        if not results:
+            print("[*] No results found in input files")
+        else:
+            output_prefix = args.output if args.output else "merged"
+            if output_prefix.endswith(".csv"):
+                output_prefix = output_prefix[:-4]
+
+            print_summary(results)
+            write_cipher_csv(results, f"{output_prefix}.csv")
+            write_affected_csv(results, f"{output_prefix}_affected.csv")
+
+        print("[+] Done")
+        return
 
     # Validate timing template if specified
     if args.timing is not None:
