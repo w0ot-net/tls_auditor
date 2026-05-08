@@ -154,7 +154,8 @@ def parse_simple_input(input_file: str) -> List[str]:
 
 
 def parse_hostport_input(input_file: str) -> List[Dict[str, str]]:
-    """Parse host:port input format (one host:port per line)."""
+    """Parse host:port input format (one host:port per line).
+    Bare hostnames without a port default to 443."""
     targets = []
     seen = set()
 
@@ -164,8 +165,13 @@ def parse_hostport_input(input_file: str) -> List[Dict[str, str]]:
             if not line or line.startswith("#"):
                 continue
 
-            host, _, port = line.rpartition(":")
-            if not host or not port:
+            if re.match(r"^[\w.\-\[\]]+:\d+$", line):
+                host, _, port = line.rpartition(":")
+            else:
+                host = line
+                port = "443"
+
+            if not host:
                 continue
 
             key = (host, port)
@@ -180,24 +186,20 @@ def parse_hostport_input(input_file: str) -> List[Dict[str, str]]:
 
 def detect_input_format(input_file: str) -> str:
     """Detect whether input file is 'rich', 'hostport', or 'simple' format."""
+    has_hostport = False
     with open(input_file, "r") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
 
-            # Check for tab-separated format with port info
-            if "\t" in line or re.search(r"\s{2,}", line):
-                if re.search(r"\(\d+/tcp\)", line):
-                    return "rich"
+            if ("\t" in line or re.search(r"\s{2,}", line)) and re.search(r"\(\d+/tcp\)", line):
+                return "rich"
 
-            # Check for host:port format
             if re.match(r"^[\w.\-\[\]]+:\d+$", line):
-                return "hostport"
+                has_hostport = True
 
-            return "simple"
-
-    return "simple"
+    return "hostport" if has_hostport else "simple"
 
 
 def build_nmap_targets(targets: List[Dict[str, str]], temp_file: str) -> Tuple[str, str]:
