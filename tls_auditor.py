@@ -323,13 +323,22 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
         if status is not None and status.get("state") != "up":
             continue
         
-        # Get hostname from nmap if available
+        # Get hostname from nmap if available. Prefer the user-supplied name
+        # (the one carried in from the input file, echoed by nmap as
+        # type="user") over a reverse-DNS PTR, which is often an ephemeral
+        # cloud rDNS entry that nmap may list first.
         nmap_hostname = ""
         hostnames_elem = host.find("hostnames")
         if hostnames_elem is not None:
-            hostname_elem = hostnames_elem.find("hostname")
-            if hostname_elem is not None:
-                nmap_hostname = hostname_elem.get("name", "")
+            for hostname_elem in hostnames_elem.findall("hostname"):
+                name = (hostname_elem.get("name") or "").strip()
+                if not name:
+                    continue
+                if hostname_elem.get("type") == "user":
+                    nmap_hostname = name
+                    break
+                if not nmap_hostname:
+                    nmap_hostname = name
         
         # Process each port
         ports_elem = host.find("ports")
