@@ -92,6 +92,23 @@ WEAK_GRADES = {"B", "C", "D", "E", "F"}
 PROTOCOLS = ("SSLv2", "SSLv3", "TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3")
 
 
+def normalize_cipher_value(value: str) -> str:
+    """Normalize a CSV cipher cell while preserving sentinel values."""
+    if not value:
+        return "-"
+
+    value = value.strip()
+    if not value or value == "-":
+        return "-"
+    if value == "All":
+        return "All"
+
+    ciphers = {line.strip() for line in value.splitlines() if line.strip()}
+    if not ciphers:
+        return "-"
+    return "\n".join(sorted(ciphers))
+
+
 def format_host_port(host: str, port: str) -> str:
     """Format host:port, bracketing IPv6 literals."""
     if ":" in host:
@@ -436,7 +453,7 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
                     return "-"
                 if not ciphers:
                     return "-"
-                return "\n".join(sorted(set(ciphers)))
+                return normalize_cipher_value("\n".join(ciphers))
             
             # Check if there are any issues
             has_issues = any(cipher_data[p] for p in PROTOCOLS) or \
@@ -492,10 +509,9 @@ def aggregate_results(
                         if existing_val == "All":
                             pass  # Keep "All"
                         else:
-                            existing_ciphers = set(c.strip() for c in existing_val.split("\n"))
-                            new_ciphers = set(c.strip() for c in new_val.split("\n"))
-                            merged = existing_ciphers | new_ciphers
-                            existing[proto] = "\n".join(sorted(merged))
+                            existing[proto] = normalize_cipher_value(
+                                f"{existing_val}\n{new_val}"
+                            )
                     elif new_val == "All":
                         existing[proto] = "All"
 
@@ -530,7 +546,7 @@ def read_cipher_csv(csv_file: str) -> List[Dict]:
                 "service": "ssl",
             }
             for proto in PROTOCOLS:
-                result[proto] = row.get(proto, "-") or "-"
+                result[proto] = normalize_cipher_value(row.get(proto, "-"))
 
             results.append(result)
 
@@ -557,14 +573,8 @@ def merge_cipher_csvs(csv_files: List[str]) -> List[Dict]:
                         existing[proto] = new_val
                     elif new_val != "-" and new_val != "All":
                         if existing_val != "All":
-                            existing_ciphers = set(
-                                c.strip() for c in existing_val.split("\n")
-                            )
-                            new_ciphers = set(
-                                c.strip() for c in new_val.split("\n")
-                            )
-                            existing[proto] = "\n".join(
-                                sorted(existing_ciphers | new_ciphers)
+                            existing[proto] = normalize_cipher_value(
+                                f"{existing_val}\n{new_val}"
                             )
                     elif new_val == "All":
                         existing[proto] = "All"
@@ -578,12 +588,22 @@ def merge_cipher_csvs(csv_files: List[str]) -> List[Dict]:
 
 def write_cipher_csv(results: List[Dict], output_file: str) -> None:
     """Write cipher table to CSV file."""
-    fieldnames = ["Host:Port"] + list(PROTOCOLS)
+    protocols_with_findings = [
+        proto for proto in PROTOCOLS
+        if any(normalize_cipher_value(r.get(proto, "-")) != "-" for r in results)
+    ]
+    fieldnames = ["Host:Port"] + protocols_with_findings
+    normalized_results = []
+    for row in results:
+        normalized_row = row.copy()
+        for proto in PROTOCOLS:
+            normalized_row[proto] = normalize_cipher_value(row.get(proto, "-"))
+        normalized_results.append(normalized_row)
     
     with open(output_file, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows(normalized_results)
     
     print(f"[+] Cipher table written to: {output_file}")
 
