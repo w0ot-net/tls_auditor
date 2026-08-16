@@ -1,5 +1,7 @@
 # Plan: Harden and Document the TLS Auditor
 
+*Distilled: 2026-08-16*
+
 ## Summary
 
 Make the existing single-file CLI trustworthy and presentable without turning it
