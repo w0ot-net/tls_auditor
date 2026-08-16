@@ -191,3 +191,38 @@ or fixture hierarchy is needed.
   source, and its Python/version and scan-behavior claims match the code.
 - The focused standard-library tests and validation commands pass without
   adding third-party tooling or leaving generated artifacts.
+
+## Execution Notes
+
+Executed on 2026-08-16.
+
+- Implemented shared endpoint parsing and port normalization, including mixed
+  hostname/IPv4 input, bare IPv6, bracketed IPv6 ports, format detection, and
+  CSV endpoint parsing.
+- Added TLS 1.1 to the deprecated-protocol policy and retained `All` as the
+  report value for every observed deprecated protocol.
+- Replaced the host/port Cartesian product with exact port-grouped scan jobs,
+  preserved the simple input mode's global `-p` behavior, added collision-free
+  multi-job/round XML names, and required at least one successful round per job.
+- Moved generated host lists into `TemporaryDirectory`, tracked every attempted
+  XML path for cleanup, preserved `--keep-xml`, and left user-supplied XML
+  untouched.
+- Made unreadable or malformed XML fatal at the CLI boundary while preserving a
+  successful no-findings result for valid empty scans.
+- Consolidated XML aggregation and CSV merge semantics in `merge_result_row`.
+- Replaced the README, added the cache-only `.gitignore`, removed trailing
+  whitespace, and added one standard-library regression module with 16 tests.
+- Changed only `.gitignore`, `README.md`, `tls_auditor.py`, and
+  `tests/test_tls_auditor.py`; the tool remains a single production script.
+- Material deviations: none. Numeric port validation/normalization is the
+  direct implementation of the planned malformed-endpoint behavior.
+- Validation passed:
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v`, direct
+  compilation, Python 3.8 grammar parsing, `python3 tls_auditor.py --help`,
+  `git diff --check`, trailing-whitespace inspection, and generated-cache
+  inspection.
+- Implementation commit: `de97ec3` (`Harden TLS audit scanning and
+  documentation`).
+- Deliberately excluded work remains unchanged: packaging, CI, third-party
+  tooling, module splitting, changelog/versioning, license selection, output
+  schema redesign, and live network scans.
