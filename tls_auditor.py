@@ -2,7 +2,7 @@
 """
 SSL/TLS Cipher Security Auditor
 Wraps nmap ssl-enum-ciphers and sslv2 scripts to identify insecure TLS configurations.
-Requires Python 3.6+
+Requires Python 3.8+
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional, Set, Tuple
 
 
@@ -23,7 +24,7 @@ from typing import Dict, List, Optional, Set, Tuple
 # =============================================================================
 
 # Deprecated protocols - report ALL ciphers as insecure
-DEPRECATED_PROTOCOLS = {"SSLv2", "SSLv3", "TLSv1.0"}
+DEPRECATED_PROTOCOLS = {"SSLv2", "SSLv3", "TLSv1.0", "TLSv1.1"}
 
 # CBC ciphers vulnerable to GOLDENDOODLE/POODLE variants
 CBC_CIPHERS = {
@@ -120,76 +121,128 @@ def format_host_port(host: str, port: str) -> str:
 # INPUT PARSING
 # =============================================================================
 
+
+def normalize_port(port: str) -> str:
+    """Validate and normalize a numeric TCP port."""
+    if not port.isdigit():
+        raise ValueError(f"invalid port: {port or '<empty>'}")
+
+    port_number = int(port)
+    if not 0 <= port_number <= 65535:
+        raise ValueError(f"port out of range: {port}")
+    return str(port_number)
+
+
+def split_explicit_host_port(value: str) -> Optional[Tuple[str, str]]:
+    """Return an explicit host/port pair, or None for a bare host."""
+    value = value.strip()
+    if not value:
+        raise ValueError("host is empty")
+
+    if value.startswith("["):
+        match = re.fullmatch(r"\[([^\[\]]+)\]:(\d+)", value)
+        if match is None or ":" not in match.group(1):
+            raise ValueError(f"invalid bracketed IPv6 endpoint: {value}")
+        return match.group(1), normalize_port(match.group(2))
+
+    if "[" in value or "]" in value:
+        raise ValueError(f"invalid bracketed IPv6 endpoint: {value}")
+
+    colon_count = value.count(":")
+    if colon_count == 0:
+        return None
+    if colon_count > 1:
+        # Unbracketed IPv6 is a bare host. Brackets are required to add a port.
+        return None
+
+    host, port = value.rsplit(":", 1)
+    if not host or any(char.isspace() for char in host):
+        raise ValueError(f"invalid host:port endpoint: {value}")
+    return host, normalize_port(port)
+
+
+def parse_host_port(
+    value: str, default_port: Optional[str] = None
+) -> Tuple[str, str]:
+    """Parse an endpoint, applying default_port only when no port is present."""
+    explicit = split_explicit_host_port(value)
+    if explicit is not None:
+        return explicit
+    if default_port is None:
+        raise ValueError(f"missing port: {value.strip()}")
+    return value.strip(), normalize_port(default_port)
+
+
 def parse_rich_input(input_file: str) -> List[Dict[str, str]]:
     """
     Parse rich input format with IP, hostname, and service columns.
     Format: IP<tab>hostname<tab>service (port/tcp)
     """
     targets = []
-    
+
     with open(input_file, "r") as f:
-        for line in f:
+        for line_number, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            
+
             # Split on tabs or multiple spaces
             parts = re.split(r"\t+|\s{2,}", line)
-            
+
             if len(parts) >= 3:
                 ip = parts[0].strip()
                 hostname = parts[1].strip()
                 service_info = parts[2].strip()
-                
-                # Extract port from service info like "www (443/tcp)" or "msrdp (3389/tcp)"
+
+                # Extract the port from values such as "www (443/tcp)".
                 port_match = re.search(r"\((\d+)/tcp\)", service_info)
                 if port_match:
-                    port = port_match.group(1)
+                    try:
+                        port = normalize_port(port_match.group(1))
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"{input_file}:{line_number}: {exc}"
+                        ) from exc
                     service = re.sub(r"\s*\(\d+/tcp\)", "", service_info).strip()
-                    
+
                     targets.append({
                         "ip": ip,
                         "hostname": hostname if hostname != "-" else "",
                         "port": port,
                         "service": service,
                     })
-    
+
     return targets
 
 
 def parse_simple_input(input_file: str) -> List[str]:
     """Parse simple input format with one IP/hostname per line."""
     hosts = []
-    
+
     with open(input_file, "r") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
                 hosts.append(line)
-    
-    return list(set(hosts))  # Deduplicate
+
+    return sorted(set(hosts))
 
 
 def parse_hostport_input(input_file: str) -> List[Dict[str, str]]:
-    """Parse host:port input format (one host:port per line).
-    Bare hostnames without a port default to 443."""
+    """Parse host:port input, defaulting bare hosts to port 443."""
     targets = []
-    seen = set()
+    seen: Set[Tuple[str, str]] = set()
 
     with open(input_file, "r") as f:
-        for line in f:
+        for line_number, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
 
-            if re.match(r"^[\w.\-\[\]]+:\d+$", line):
-                host, _, port = line.rpartition(":")
-            else:
-                host = line
-                port = "443"
-
-            if not host:
-                continue
+            try:
+                host, port = parse_host_port(line, default_port="443")
+            except ValueError as exc:
+                raise ValueError(f"{input_file}:{line_number}: {exc}") from exc
 
             key = (host, port)
             if key in seen:
@@ -205,54 +258,68 @@ def detect_input_format(input_file: str) -> str:
     """Detect whether input file is 'rich', 'hostport', or 'simple' format."""
     has_hostport = False
     with open(input_file, "r") as f:
-        for line in f:
+        for line_number, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
 
-            if ("\t" in line or re.search(r"\s{2,}", line)) and re.search(r"\(\d+/tcp\)", line):
+            if (
+                ("\t" in line or re.search(r"\s{2,}", line))
+                and re.search(r"\(\d+/tcp\)", line)
+            ):
                 return "rich"
 
-            if re.match(r"^[\w.\-\[\]]+:\d+$", line):
-                has_hostport = True
+            try:
+                if split_explicit_host_port(line) is not None:
+                    has_hostport = True
+            except ValueError as exc:
+                raise ValueError(f"{input_file}:{line_number}: {exc}") from exc
 
     return "hostport" if has_hostport else "simple"
 
 
-def build_nmap_targets(targets: List[Dict[str, str]], temp_file: str) -> Tuple[str, str]:
-    """
-    Build nmap input file and port list from rich targets.
-    Returns (temp_file_path, comma_separated_ports)
-    """
-    # Collect unique host:port combinations
-    host_ports = {}  # ip -> set of ports
-    
+def build_scan_jobs(targets: List[Dict[str, str]]) -> List[Tuple[str, List[str]]]:
+    """Group rich targets by port without creating new host/port pairs."""
+    hosts_by_port: Dict[str, Set[str]] = {}
+
     for t in targets:
-        ip = t["ip"]
-        port = t["port"]
-        
-        if ip not in host_ports:
-            host_ports[ip] = set()
-        host_ports[ip].add(port)
-    
-    # Write hosts to temp file
-    with open(temp_file, "w") as f:
-        for ip in sorted(host_ports.keys()):
-            f.write(f"{ip}\n")
-    
-    # Collect all unique ports
-    all_ports = set()
-    for ports in host_ports.values():
-        all_ports.update(ports)
-    
-    return temp_file, ",".join(sorted(all_ports, key=int))
+        hosts_by_port.setdefault(t["port"], set()).add(t["ip"])
+
+    return [
+        (port, sorted(hosts_by_port[port]))
+        for port in sorted(hosts_by_port, key=int)
+    ]
+
+
+def scan_xml_path(
+    output_prefix: str,
+    port: str,
+    round_number: int,
+    job_count: int,
+    round_count: int,
+) -> str:
+    """Build a collision-free XML path while preserving legacy names."""
+    if job_count == 1 and round_count == 1:
+        return f"{output_prefix}.xml"
+
+    suffixes = []
+    if job_count > 1:
+        suffixes.append(f"port{port}")
+    if round_count > 1:
+        suffixes.append(f"round{round_number}")
+    return f"{output_prefix}_{'_'.join(suffixes)}.xml"
 
 
 # =============================================================================
 # NMAP EXECUTION
 # =============================================================================
 
-def run_nmap(input_file: str, ports: str, xml_output: str, timing: Optional[str] = None) -> bool:
+def run_nmap(
+    input_file: str,
+    ports: str,
+    xml_output: str,
+    timing: Optional[str] = None,
+) -> bool:
     """Run nmap with ssl-enum-ciphers and sslv2 scripts."""
     cmd = [
         "nmap",
@@ -288,26 +355,29 @@ def is_cipher_insecure(cipher_name: str, grade: str, protocol: str) -> bool:
     # All ciphers in deprecated protocols are insecure
     if protocol in DEPRECATED_PROTOCOLS:
         return True
-    
+
     # Weak grades (B-F)
     if grade in WEAK_GRADES:
         return True
-    
+
     # CBC ciphers (GOLDENDOODLE/POODLE)
     if "CBC" in cipher_name or cipher_name in CBC_CIPHERS:
         return True
-    
+
     # Known weak ciphers
     if cipher_name in WEAK_CIPHERS:
         return True
-    
+
     return False
 
 
-def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] = None) -> List[Dict]:
+def parse_nmap_xml(
+    xml_file: str,
+    rich_targets: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict]:
     """Parse nmap XML output and extract SSL/TLS cipher info."""
     results = []
-    
+
     # Build hostname lookup from rich targets if available
     hostname_lookup = {}
     service_lookup = {}
@@ -318,14 +388,10 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
                 hostname_lookup[key] = t["hostname"]
             if t.get("service"):
                 service_lookup[key] = t["service"]
-    
-    try:
-        tree = ET.parse(xml_file)
-        root = tree.getroot()
-    except ET.ParseError as e:
-        print(f"[!] Error parsing XML: {e}", file=sys.stderr)
-        return results
-    
+
+    tree = ET.parse(xml_file)
+    root = tree.getroot()
+
     for host in root.findall("host"):
         # Get IP address
         addr_elem = host.find("address[@addrtype='ipv4']")
@@ -334,12 +400,12 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
         if addr_elem is None:
             continue
         ip = addr_elem.get("addr")
-        
+
         # Check host status
         status = host.find("status")
         if status is not None and status.get("state") != "up":
             continue
-        
+
         # Get hostname from nmap if available. Prefer the user-supplied name
         # (the one carried in from the input file, echoed by nmap as
         # type="user") over a reverse-DNS PTR, which is often an ephemeral
@@ -356,125 +422,150 @@ def parse_nmap_xml(xml_file: str, rich_targets: Optional[List[Dict[str, str]]] =
                     break
                 if not nmap_hostname:
                     nmap_hostname = name
-        
+
         # Process each port
         ports_elem = host.find("ports")
         if ports_elem is None:
             continue
-        
+
         for port in ports_elem.findall("port"):
             port_id = port.get("portid")
-            
+
             # Check if port is open
             state = port.find("state")
             if state is None or state.get("state") != "open":
                 continue
-            
+
             # Get service info
             service = port.find("service")
             service_name = ""
             if service is not None:
                 service_name = service.get("name", "")
-            
+
             # Look for ssl-enum-ciphers script output
             ssl_script = port.find("script[@id='ssl-enum-ciphers']")
             sslv2_script = port.find("script[@id='sslv2']")
-            
+
             if ssl_script is None and sslv2_script is None:
                 continue
-            
+
             # Initialize cipher data for each protocol
             cipher_data = {p: [] for p in PROTOCOLS}
-            protocols_present = set()  # Track which protocols were seen (even if empty)
-            
+            protocols_present = set()  # Track protocols seen, even when empty
+
             # Parse ssl-enum-ciphers output
             if ssl_script is not None:
                 for table in ssl_script.findall("table"):
                     protocol = table.get("key", "")
                     if protocol not in cipher_data:
                         continue
-                    
+
                     # Mark this protocol as present
                     protocols_present.add(protocol)
-                    
+
                     # Find ciphers table within this protocol
                     ciphers_table = table.find("table[@key='ciphers']")
                     if ciphers_table is None:
                         continue
-                    
+
                     for cipher_table in ciphers_table.findall("table"):
                         cipher_name = ""
                         grade = ""
-                        
+
                         for elem in cipher_table.findall("elem"):
                             key = elem.get("key", "")
                             if key == "name":
                                 cipher_name = elem.text or ""
                             elif key == "strength":
                                 grade = elem.text or ""
-                        
-                        if cipher_name and is_cipher_insecure(cipher_name, grade, protocol):
+
+                        if cipher_name and is_cipher_insecure(
+                            cipher_name, grade, protocol
+                        ):
                             cipher_data[protocol].append(cipher_name)
-            
+
             # Parse sslv2 script output
             if sslv2_script is not None:
                 output = sslv2_script.get("output", "")
                 if "SSLv2 supported" in output:
                     # Mark SSLv2 as present
                     protocols_present.add("SSLv2")
-                    
+
                     # Extract SSLv2 ciphers
-                    for cipher_table in sslv2_script.findall(".//table[@key='ciphers']/table"):
+                    cipher_tables = sslv2_script.findall(
+                        ".//table[@key='ciphers']/table"
+                    )
+                    for cipher_table in cipher_tables:
                         for elem in cipher_table.findall("elem[@key='name']"):
                             if elem.text:
                                 cipher_data["SSLv2"].append(elem.text)
-                    
+
                     # Fallback: parse from output text
                     if not cipher_data["SSLv2"]:
                         for match in re.findall(r"SSL2_\w+", output):
                             cipher_data["SSLv2"].append(match)
-            
+
             # Determine hostname to display
             lookup_key = f"{ip}:{port_id}"
             hostname = hostname_lookup.get(lookup_key, nmap_hostname)
             host_display = hostname if hostname else ip
-            
+
             # Determine service name for affected systems
             svc = service_lookup.get(lookup_key, service_name)
             if not svc:
                 svc = "ssl"
-            
+
             # Format cipher output
-            def format_ciphers(ciphers: List[str], protocol: str, present: bool) -> str:
+            def format_ciphers(
+                ciphers: List[str], protocol: str, present: bool
+            ) -> str:
                 if protocol in DEPRECATED_PROTOCOLS:
-                    # Deprecated protocol: report "All" if present, even if cipher list is empty
+                    # Report "All" even if Nmap omitted the cipher list.
                     if present or ciphers:
                         return "All"
                     return "-"
                 if not ciphers:
                     return "-"
                 return normalize_cipher_value("\n".join(ciphers))
-            
+
             # Check if there are any issues
-            has_issues = any(cipher_data[p] for p in PROTOCOLS) or \
-                         any(p in protocols_present for p in DEPRECATED_PROTOCOLS)
-            
+            has_issues = any(cipher_data[p] for p in PROTOCOLS) or any(
+                p in protocols_present for p in DEPRECATED_PROTOCOLS
+            )
+
             if has_issues:
-                results.append({
+                row = {
                     "Host:Port": format_host_port(host_display, port_id),
-                    "SSLv2": format_ciphers(cipher_data["SSLv2"], "SSLv2", "SSLv2" in protocols_present),
-                    "SSLv3": format_ciphers(cipher_data["SSLv3"], "SSLv3", "SSLv3" in protocols_present),
-                    "TLSv1.0": format_ciphers(cipher_data["TLSv1.0"], "TLSv1.0", "TLSv1.0" in protocols_present),
-                    "TLSv1.1": format_ciphers(cipher_data["TLSv1.1"], "TLSv1.1", "TLSv1.1" in protocols_present),
-                    "TLSv1.2": format_ciphers(cipher_data["TLSv1.2"], "TLSv1.2", "TLSv1.2" in protocols_present),
-                    "TLSv1.3": format_ciphers(cipher_data["TLSv1.3"], "TLSv1.3", "TLSv1.3" in protocols_present),
                     "ip": ip,
                     "hostname": hostname if hostname else "-",
                     "port": port_id,
                     "service": svc,
-                })
-    
+                }
+                for protocol in PROTOCOLS:
+                    row[protocol] = format_ciphers(
+                        cipher_data[protocol],
+                        protocol,
+                        protocol in protocols_present,
+                    )
+                results.append(row)
+
     return results
+
+
+def merge_result_row(existing: Dict, new: Dict) -> None:
+    """Merge cipher findings from new into an existing Host:Port row."""
+    for proto in PROTOCOLS:
+        existing_value = existing.get(proto, "-")
+        new_value = new.get(proto, "-")
+
+        if existing_value == "-":
+            existing[proto] = new_value
+        elif new_value == "All":
+            existing[proto] = "All"
+        elif new_value != "-" and existing_value != "All":
+            existing[proto] = normalize_cipher_value(
+                f"{existing_value}\n{new_value}"
+            )
 
 
 def aggregate_results(
@@ -484,7 +575,6 @@ def aggregate_results(
     Aggregate cipher findings from multiple nmap XML files.
     Deduplicates findings across rounds - a cipher is reported if found in ANY round.
     """
-    all_results = []
     seen_host_ports = {}  # host:port -> merged result dict
 
     for xml_file in xml_files:
@@ -496,27 +586,9 @@ def aggregate_results(
             if host_port not in seen_host_ports:
                 seen_host_ports[host_port] = row.copy()
             else:
-                # Merge ciphers from this round into existing result
-                existing = seen_host_ports[host_port]
-                for proto in PROTOCOLS:
-                    existing_val = existing.get(proto, "-")
-                    new_val = row.get(proto, "-")
+                merge_result_row(seen_host_ports[host_port], row)
 
-                    if existing_val == "-":
-                        existing[proto] = new_val
-                    elif new_val != "-" and new_val != "All":
-                        # Merge cipher lists (both are non-empty, non-"All")
-                        if existing_val == "All":
-                            pass  # Keep "All"
-                        else:
-                            existing[proto] = normalize_cipher_value(
-                                f"{existing_val}\n{new_val}"
-                            )
-                    elif new_val == "All":
-                        existing[proto] = "All"
-
-    all_results = list(seen_host_ports.values())
-    return all_results
+    return list(seen_host_ports.values())
 
 
 def read_cipher_csv(csv_file: str) -> List[Dict]:
@@ -529,14 +601,12 @@ def read_cipher_csv(csv_file: str) -> List[Dict]:
             if not host_port:
                 continue
 
-            # Parse host and port back from Host:Port
-            if host_port.startswith("["):
-                # IPv6: [addr]:port
-                bracket_end = host_port.index("]")
-                host = host_port[1:bracket_end]
-                port = host_port[bracket_end + 2:]
-            else:
-                host, _, port = host_port.rpartition(":")
+            try:
+                host, port = parse_host_port(host_port)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{csv_file}:{reader.line_num}: {exc}"
+                ) from exc
 
             result = {
                 "Host:Port": host_port,
@@ -564,20 +634,7 @@ def merge_cipher_csvs(csv_files: List[str]) -> List[Dict]:
             if host_port not in seen:
                 seen[host_port] = row.copy()
             else:
-                existing = seen[host_port]
-                for proto in PROTOCOLS:
-                    existing_val = existing.get(proto, "-")
-                    new_val = row.get(proto, "-")
-
-                    if existing_val == "-":
-                        existing[proto] = new_val
-                    elif new_val != "-" and new_val != "All":
-                        if existing_val != "All":
-                            existing[proto] = normalize_cipher_value(
-                                f"{existing_val}\n{new_val}"
-                            )
-                    elif new_val == "All":
-                        existing[proto] = "All"
+                merge_result_row(seen[host_port], row)
 
     return list(seen.values())
 
@@ -599,12 +656,12 @@ def write_cipher_csv(results: List[Dict], output_file: str) -> None:
         for proto in PROTOCOLS:
             normalized_row[proto] = normalize_cipher_value(row.get(proto, "-"))
         normalized_results.append(normalized_row)
-    
+
     with open(output_file, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(normalized_results)
-    
+
     print(f"[+] Cipher table written to: {output_file}")
 
 
@@ -618,7 +675,7 @@ def write_affected_csv(results: List[Dict], output_file: str) -> None:
                 r["hostname"],
                 f"{r['service']} ({r['port']}/tcp)"
             ])
-    
+
     print(f"[+] Affected systems written to: {output_file}")
 
 
@@ -627,17 +684,17 @@ def print_summary(results: List[Dict]) -> None:
     if not results:
         print("[*] No SSL/TLS services with issues found")
         return
-    
+
     print(f"\n[+] Found {len(results)} host(s) with insecure ciphers:")
-    
+
     # Count by protocol
     proto_counts = {p: 0 for p in PROTOCOLS}
-    
+
     for r in results:
         for proto in PROTOCOLS:
             if r.get(proto, "-") != "-":
                 proto_counts[proto] += 1
-    
+
     for proto in PROTOCOLS:
         count = proto_counts[proto]
         if count > 0:
@@ -663,11 +720,12 @@ Input formats:
     192.168.1.1:443
     192.168.1.2:8443
     example.com:636
+    [2001:db8::10]:443
 
   Rich (auto-detects ports):
-    172.16.1.10    AD02.example.com    ldaps? (636/tcp)
+    172.16.1.10    AD02.example.com    ldaps (636/tcp)
     172.16.1.41    Web.example.com     www (443/tcp)
-    172.16.1.42    -                   https? (443/tcp)
+    172.16.1.42    -                   https (443/tcp)
 
 Examples:
   %(prog)s -i hosts.txt -p 443
@@ -676,13 +734,13 @@ Examples:
   %(prog)s -i rich_targets.txt
   %(prog)s --xml existing_scan.xml -o results.csv
   %(prog)s --merge scan1.csv scan2.csv -o combined
-        """
+        """,
     )
-    
+
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
         "-i", "--input",
-        help="Input file (IP list or rich format with ports)"
+        help="Input file (simple, host:port, or rich format)"
     )
     input_group.add_argument(
         "--xml",
@@ -694,21 +752,21 @@ Examples:
         metavar="CSV",
         help="Merge multiple cipher audit CSV files (not affected CSVs)"
     )
-    
+
     parser.add_argument(
         "-p", "--ports",
         help="Comma-separated list of ports to scan (required for simple input format)"
     )
-    
+
     parser.add_argument(
         "-o", "--output",
         help="Output CSV file prefix (default: ssl_audit_YYYYMMDD_HHMMSS)"
     )
-    
+
     parser.add_argument(
         "--keep-xml",
         action="store_true",
-        help="Keep the intermediate nmap XML file"
+        help="Keep intermediate nmap XML file(s)"
     )
 
     parser.add_argument(
@@ -725,12 +783,15 @@ Examples:
         default=1,
         choices=range(1, 11),
         metavar="N",
-        help="Number of times to run the scan (1-10). Results are aggregated. Default: 1"
+        help=(
+            "Number of times to run the scan (1-10). Results are aggregated. "
+            "Default: 1"
+        ),
     )
 
     args = parser.parse_args()
 
-    # Handle --merge mode early (no scanning needed)
+    # Handle --merge mode early; it does not create intermediate XML.
     if args.merge:
         for f in args.merge:
             if not Path(f).is_file():
@@ -738,7 +799,11 @@ Examples:
                 sys.exit(1)
 
         print(f"[*] Merging {len(args.merge)} CSV file(s)...")
-        results = merge_cipher_csvs(args.merge)
+        try:
+            results = merge_cipher_csvs(args.merge)
+        except (OSError, ValueError, csv.Error) as exc:
+            print(f"[!] Error: {exc}", file=sys.stderr)
+            sys.exit(1)
 
         if not results:
             print("[*] No results found in input files")
@@ -754,135 +819,139 @@ Examples:
         print("[+] Done")
         return
 
-    # Validate timing template if specified
+    # Validate timing template if specified.
     if args.timing is not None:
         valid_timing = ["0", "1", "2", "3", "4", "5"]
         if args.timing not in valid_timing:
             parser.error(f"Invalid timing template: {args.timing}. Must be 0-5.")
-    
+
     # Generate output filename prefix
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_prefix = args.output if args.output else f"ssl_audit_{timestamp}"
-    
+
     # Remove .csv extension if provided
     if output_prefix.endswith(".csv"):
         output_prefix = output_prefix[:-4]
-    
+
     cipher_csv = f"{output_prefix}.csv"
     affected_csv = f"{output_prefix}_affected.csv"
-    xml_output = f"{output_prefix}.xml"
-    
     rich_targets = None
-    
-    if args.xml:
-        # Parse existing XML
-        if not Path(args.xml).is_file():
-            print(f"[!] Error: XML file not found: {args.xml}", file=sys.stderr)
-            sys.exit(1)
-        
-        print(f"[*] Parsing existing XML: {args.xml}")
-        xml_output = args.xml
-    
-    else:
-        # Validate input file
-        if not Path(args.input).is_file():
-            print(f"[!] Error: Input file not found: {args.input}", file=sys.stderr)
-            sys.exit(1)
-        
-        # Detect input format
-        input_format = detect_input_format(args.input)
-        print(f"[*] Detected input format: {input_format}")
-        
-        if input_format in ("rich", "hostport"):
-            # Parse rich or host:port format
-            if input_format == "rich":
-                rich_targets = parse_rich_input(args.input)
-            else:
-                rich_targets = parse_hostport_input(args.input)
+    attempted_xml_files: List[str] = []
 
-            if not rich_targets:
-                print("[!] Error: No valid targets found in input file", file=sys.stderr)
-                sys.exit(1)
+    try:
+        if args.xml:
+            if not Path(args.xml).is_file():
+                raise FileNotFoundError(f"XML file not found: {args.xml}")
 
-            print(f"[*] Found {len(rich_targets)} target(s)")
-
-            # Build nmap input
-            temp_file = f"/tmp/ssl_audit_{timestamp}_hosts.txt"
-            nmap_input, ports = build_nmap_targets(rich_targets, temp_file)
-
+            print(f"[*] Parsing existing XML: {args.xml}")
+            xml_files = [args.xml]
         else:
-            # Simple format - ports required
-            if not args.ports:
-                print("[!] Error: -p/--ports is required for simple input format", file=sys.stderr)
-                sys.exit(1)
-            
-            hosts = parse_simple_input(args.input)
-            if not hosts:
-                print("[!] Error: No valid hosts found in input file", file=sys.stderr)
-                sys.exit(1)
-            
-            print(f"[*] Found {len(hosts)} unique host(s)")
-            
-            # Write deduplicated hosts to temp file
-            temp_file = f"/tmp/ssl_audit_{timestamp}_hosts.txt"
-            with open(temp_file, "w") as f:
-                for host in sorted(hosts):
-                    f.write(f"{host}\n")
-            
-            nmap_input = temp_file
-            ports = args.ports
-        
-        # Run nmap (potentially multiple rounds)
-        print(f"[*] Scanning ports: {ports}")
+            if not Path(args.input).is_file():
+                raise FileNotFoundError(f"Input file not found: {args.input}")
 
-        xml_files = []
-        for round_num in range(1, args.rounds + 1):
-            if args.rounds > 1:
-                print(f"\n[*] Starting scan round {round_num}/{args.rounds}")
-                round_xml = f"{output_prefix}_round{round_num}.xml"
+            input_format = detect_input_format(args.input)
+            print(f"[*] Detected input format: {input_format}")
+
+            if input_format in ("rich", "hostport"):
+                if input_format == "rich":
+                    rich_targets = parse_rich_input(args.input)
+                else:
+                    rich_targets = parse_hostport_input(args.input)
+
+                if not rich_targets:
+                    raise ValueError("no valid targets found in input file")
+
+                print(f"[*] Found {len(rich_targets)} target(s)")
+                scan_jobs = build_scan_jobs(rich_targets)
             else:
-                round_xml = xml_output
+                if not args.ports:
+                    raise ValueError(
+                        "-p/--ports is required for simple input format"
+                    )
 
-            success = run_nmap(nmap_input, ports, round_xml, args.timing)
-            if success:
-                xml_files.append(round_xml)
-            else:
-                print(f"[!] Round {round_num} failed", file=sys.stderr)
+                hosts = parse_simple_input(args.input)
+                if not hosts:
+                    raise ValueError("no valid hosts found in input file")
 
-        if not xml_files:
-            print("[!] All nmap scans failed", file=sys.stderr)
-            sys.exit(1)
+                print(f"[*] Found {len(hosts)} unique host(s)")
+                scan_jobs = [(args.ports, hosts)]
 
-        # Cleanup temp file
-        Path(temp_file).unlink(missing_ok=True)
+            xml_files = []
+            failed_jobs = []
 
-    # Parse results
-    print("[*] Parsing results...")
-    if args.xml:
-        results = parse_nmap_xml(xml_output, rich_targets)
-        xml_files = [xml_output]
-    elif args.rounds > 1:
-        results = aggregate_results(xml_files, rich_targets)
-    else:
-        results = parse_nmap_xml(xml_files[0], rich_targets)
-    
-    if not results:
-        print("[*] No SSL/TLS services with issues found")
-    else:
-        print_summary(results)
-        
-        # Write output files
-        write_cipher_csv(results, cipher_csv)
-        write_affected_csv(results, affected_csv)
-    
-    # Cleanup XML unless requested to keep (or if parsing existing)
-    if not args.keep_xml and not args.xml:
-        for xml_file in xml_files:
-            Path(xml_file).unlink(missing_ok=True)
-    elif args.keep_xml and not args.xml:
-        for xml_file in xml_files:
-            print(f"[*] XML file kept: {xml_file}")
-    
+            with TemporaryDirectory(prefix="tls_auditor_") as temp_dir:
+                for job_number, (ports, hosts) in enumerate(scan_jobs, 1):
+                    nmap_input = Path(temp_dir) / f"hosts_{job_number}.txt"
+                    nmap_input.write_text("\n".join(hosts) + "\n")
+                    job_succeeded = False
+
+                    print(
+                        f"[*] Scanning port(s) {ports} on {len(hosts)} host(s)"
+                    )
+                    for round_number in range(1, args.rounds + 1):
+                        if len(scan_jobs) > 1 or args.rounds > 1:
+                            print(
+                                "[*] Starting port(s) "
+                                f"{ports}, round {round_number}/{args.rounds}"
+                            )
+
+                        round_xml = scan_xml_path(
+                            output_prefix,
+                            ports,
+                            round_number,
+                            len(scan_jobs),
+                            args.rounds,
+                        )
+                        attempted_xml_files.append(round_xml)
+
+                        if run_nmap(
+                            str(nmap_input),
+                            ports,
+                            round_xml,
+                            args.timing,
+                        ):
+                            xml_files.append(round_xml)
+                            job_succeeded = True
+                        else:
+                            print(
+                                f"[!] Port(s) {ports}, round {round_number} failed",
+                                file=sys.stderr,
+                            )
+
+                    if not job_succeeded:
+                        failed_jobs.append(ports)
+
+            if failed_jobs:
+                raise RuntimeError(
+                    "no successful scan round for port group(s): "
+                    + ", ".join(failed_jobs)
+                )
+
+        print("[*] Parsing results...")
+        if len(xml_files) > 1:
+            results = aggregate_results(xml_files, rich_targets)
+        else:
+            results = parse_nmap_xml(xml_files[0], rich_targets)
+
+        if not results:
+            print("[*] No SSL/TLS services with issues found")
+        else:
+            print_summary(results)
+            write_cipher_csv(results, cipher_csv)
+            write_affected_csv(results, affected_csv)
+
+    except (OSError, ET.ParseError, ValueError, RuntimeError) as exc:
+        print(f"[!] Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if not args.xml and not args.keep_xml:
+            for xml_file in attempted_xml_files:
+                Path(xml_file).unlink(missing_ok=True)
+        elif not args.xml:
+            for xml_file in attempted_xml_files:
+                if Path(xml_file).exists():
+                    print(f"[*] XML file kept: {xml_file}")
+
     print("[+] Done")
 
 
